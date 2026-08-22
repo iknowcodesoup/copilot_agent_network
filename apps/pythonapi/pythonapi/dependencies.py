@@ -95,6 +95,16 @@ def get_required_voice_factory_gateway(request: Request) -> VoiceFactoryGateway:
     return gateway
 
 
+def get_voice_factory_gateway(request: Request) -> VoiceFactoryGateway | None:
+    """None without a voice factory.
+
+    For a route that owns its answer in Postgres and asks the factory only for
+    a name, such as assign_run or get_voice. Those must keep working with
+    VOICE_FACTORY_URL unset, so they take this instead of the required one.
+    """
+    return request.app.state.voice_factory_gateway
+
+
 def get_required_voice_run_repository(request: Request) -> VoiceRunRepository:
     return request.app.state.voice_run_repository
 

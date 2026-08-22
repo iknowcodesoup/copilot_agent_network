@@ -75,6 +75,11 @@ class VoiceRunRow(Base):
     VoiceRunReconciler reads it to decide what to do next, so a run survives a
     restart mid-pipeline. Audio, clips, and review decisions all stay on the
     voice factory host - only the run state lives here.
+
+    Every column below is something that would be lost if the factory's work/
+    directory were deleted. Anything the factory can recompute from work/ -
+    the video's title, its clip counts, its speaker map - is read from the
+    factory instead, so no fact here has two writers.
     """
 
     __tablename__ = "voice_runs"
@@ -87,15 +92,16 @@ class VoiceRunRow(Base):
     id: Mapped[str] = mapped_column(primary_key=True)
     primary_character: Mapped[str]
     source_url: Mapped[str]
+    # the only join to the voice factory, which owns the video: its title, its
+    # clips, its counts, and the speaker map that names their characters. None
+    # until the run resolves it.
     video_id: Mapped[str | None]
-    video_title: Mapped[str | None]
     phase: Mapped[str]
     diarize: Mapped[bool] = mapped_column(default=True)
     num_speakers: Mapped[int | None]
-    # speaker label -> character name, or None to discard that speaker
-    speaker_map: Mapped[dict] = mapped_column(JSONB, default=dict)
     # speaker label -> Voice id (Story 3.2), or None to discard that speaker.
-    # DB-only, never sent to the voice factory host - see VoiceRun.voice_assignments.
+    # DB-only, and the factory has no Voice concept, so nothing there mirrors
+    # it - see VoiceRun.voice_assignments.
     voice_assignments: Mapped[dict] = mapped_column(JSONB, default=dict)
     # the control API job backing the current phase, if one is running
     voyicer_job_id: Mapped[str | None]
@@ -106,8 +112,6 @@ class VoiceRunRow(Base):
     # COMMITTING runs three stages in order (commit, resample, preprocess).
     # This is which one is in flight.
     commit_stage_index: Mapped[int] = mapped_column(default=0)
-    clip_count: Mapped[int] = mapped_column(default=0)
-    approved_count: Mapped[int] = mapped_column(default=0)
     # last training progress the factory reported over its webhook
     current_epoch: Mapped[int | None]
     current_loss: Mapped[float | None]

@@ -254,15 +254,16 @@ def _diarizing_node_factory(gateway: VoiceFactoryGateway):
         if not run.video_id:
             return _fail(run, "No video id recorded for this run")
         try:
-            clips = await gateway.get_clips(run.video_id)
+            video_clips = await gateway.get_clips(run.video_id)
         except VoiceFactoryTransientError as error:
             return _defer(run, f"Could not read clips: {error}")
         except VoiceFactoryError as error:
             return _fail(run, f"Could not read clips: {error}")
 
-        run.clip_count = len(clips)
-        run.approved_count = sum(1 for clip in clips if clip.keep)
-        if not clips:
+        # the clips are read to check that ingest produced any, not to count
+        # them into the run: the count is the factory's, recomputed from
+        # review.csv whenever anyone asks
+        if not video_clips.clips:
             return _fail(run, "Ingest produced no clips. Try a different video.")
         return _advance(run, VoiceRunPhase.AWAITING_REVIEW)
 

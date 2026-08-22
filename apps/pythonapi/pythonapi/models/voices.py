@@ -56,6 +56,9 @@ class VoiceContribution(BaseModel):
     voice_id: str
     run_id: str
     video_id: str | None = None
+    # not stored: the factory owns the title, so a reader resolves it from
+    # video_id at read time -- see core/video_titles.py. None when the factory
+    # is unset or no longer holds that video.
     video_title: str | None = None
     speaker_label: str
     created_at: datetime

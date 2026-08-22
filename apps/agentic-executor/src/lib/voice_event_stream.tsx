@@ -2,59 +2,23 @@
 
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
-import { voiceApiBase, voiceQueryKeys, type JobLog, type VoiceRun } from "./voice_api";
+import { Subscription } from "rxjs";
+import { voiceQueryKeys, type JobLog, type VoiceRun } from "./voice_api";
+import { runLogs$, runSnapshots$, runUpdates$ } from "./voice_streams";
 
 /*
- * One EventSource for the whole application, and the only thing that knows the
- * server pushes at all. It writes what arrives into the TanStack Query cache
- * under the keys the ordinary hooks already read, so every voice component
- * keeps its existing useVoiceRun/useVoiceRuns call and gets live data without
- * changing a line.
+ * Where the stream meets the cache.
  *
- * EventSource handles the hard parts of reconnecting by itself. It retries on
- * its own schedule and sends back the last `id:` it saw as Last-Event-ID, which
- * the server treats as a replay position. So nothing here counts events, tracks
- * a cursor, or holds a second copy of the state.
+ * voice_streams.ts owns the connection and hands out one observable per event
+ * kind. This file is the only subscriber that writes: it puts what arrives into
+ * the TanStack Query cache under the keys the ordinary hooks already read, so
+ * every voice component keeps its existing useVoiceRun/useVoiceRuns call and
+ * gets live data without changing a line.
+ *
+ * Nothing here counts events or tracks a cursor. EventSource sends back the
+ * last `id:` it saw as Last-Event-ID and the server treats that as a replay
+ * position, so reconnect handling lives in the transport, not in this file.
  */
-
-/* AG-UI event envelopes, as the encoder writes them on the wire. */
-const SNAPSHOT_EVENT_TYPE = "STATE_SNAPSHOT";
-const CUSTOM_EVENT_TYPE = "CUSTOM";
-const RUN_UPDATED_EVENT_NAME = "voice.run.updated";
-const RUN_LOG_EVENT_NAME = "voice.run.log";
-
-interface AgentUiEvent {
-  type: string;
-  name?: string;
-  value?: unknown;
-  snapshot?: { runs?: unknown[] };
-}
-
-/*
- * FastAPI speaks snake_case and this app speaks camelCase, the same as every
- * response voice_api.ts converts. The stream carries the same run shape, so it
- * needs the same conversion.
- */
-function toCamelCase(value: string): string {
-  return value.replace(/_([a-z0-9])/g, (_, character) =>
-    character.toUpperCase(),
-  );
-}
-
-function convertKeys(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => convertKeys(item));
-  }
-  if (value !== null && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
-        toCamelCase(key),
-        convertKeys(entry),
-      ]),
-    );
-  }
-  return value;
-}
 
 /*
  * Drop any fetch still in the air for this key before writing to it.
@@ -83,13 +47,9 @@ function applyRunUpdate(queryClient: QueryClient, run: VoiceRun): void {
   cancelFetchesFor(queryClient, voiceQueryKeys.runs);
   queryClient.setQueryData(voiceQueryKeys.run(run.id), run);
   queryClient.setQueryData<VoiceRun[]>(voiceQueryKeys.runs, (runs) => {
-    if (!runs) {
-      return [run];
-    }
+    if (!runs) return [run];
     const index = runs.findIndex((existing) => existing.id === run.id);
-    if (index === -1) {
-      return [run, ...runs];
-    }
+    if (index === -1) return [run, ...runs];
     const next = runs.slice();
     next[index] = run;
     return next;
@@ -109,9 +69,7 @@ function applyLogChunk(
   const key = voiceQueryKeys.log(chunk.runId);
   cancelFetchesFor(queryClient, key);
   queryClient.setQueryData<JobLog>(key, (prev) => {
-    if (prev && chunk.offset <= prev.offset) {
-      return prev;
-    }
+    if (prev && chunk.offset <= prev.offset) return prev;
     return {
       offset: chunk.offset,
       content: (prev?.content ?? "") + chunk.content,
@@ -130,54 +88,36 @@ function applySnapshot(queryClient: QueryClient, runs: VoiceRun[]): void {
 }
 
 /*
- * Apply one raw SSE frame to the cache. Exported because this is where the
- * whole contract with the server lives - the envelope shapes, the case
- * conversion, and the rule that applying an event twice is safe.
+ * One subscription per event kind, all torn down together.
+ *
+ * Job progress only. A create or an update carries its new state back in its
+ * own response, so it needs nothing from here.
  */
-export function applyVoiceEvent(queryClient: QueryClient, data: string): void {
-  let event: AgentUiEvent;
-  try {
-    event = JSON.parse(data);
-  } catch {
-    // one unreadable frame must not take the connection down with it
-    return;
-  }
-
-  if (event.type === SNAPSHOT_EVENT_TYPE && event.snapshot?.runs) {
-    applySnapshot(queryClient, convertKeys(event.snapshot.runs) as VoiceRun[]);
-    return;
-  }
-  if (
-    event.type === CUSTOM_EVENT_TYPE &&
-    event.name === RUN_UPDATED_EVENT_NAME
-  ) {
-    applyRunUpdate(queryClient, convertKeys(event.value) as VoiceRun);
-    return;
-  }
-  if (event.type === CUSTOM_EVENT_TYPE && event.name === RUN_LOG_EVENT_NAME) {
-    applyLogChunk(
-      queryClient,
-      convertKeys(event.value) as {
-        runId: string;
-        offset: number;
-        content: string;
-      },
-    );
-  }
-}
-
 function useVoiceEventStream(): void {
   const queryClient = useQueryClient();
 
   useEffect(() => {
-    const source = new EventSource(`${voiceApiBase}/events`);
-    source.onmessage = (event) => applyVoiceEvent(queryClient, event.data);
-    source.onerror = () => {
-      // EventSource reconnects by itself, and replays from Last-Event-ID when
-      // it does. Logging is all there is to do here.
-      console.warn("Voice event stream dropped, reconnecting");
-    };
-    return () => source.close();
+    const subscription = new Subscription();
+
+    subscription.add(
+      runSnapshots$.subscribe((runs) =>
+        applySnapshot(queryClient, runs as VoiceRun[]),
+      ),
+    );
+    subscription.add(
+      runUpdates$.subscribe((run) =>
+        applyRunUpdate(queryClient, run as VoiceRun),
+      ),
+    );
+    subscription.add(
+      runLogs$.subscribe((log) =>
+        applyLogChunk(
+          queryClient,
+          log as { runId: string; offset: number; content: string },
+        ),
+      ),
+    );
+    return () => subscription.unsubscribe();
   }, [queryClient]);
 }
 

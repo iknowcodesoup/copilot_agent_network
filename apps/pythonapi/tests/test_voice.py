@@ -12,6 +12,7 @@ import pytest
 from starlette.requests import Request
 
 from pythonapi.config import settings
+from pythonapi.core.video_titles import resolve_video_titles
 from pythonapi.core.voice_events import (
     EVENT_RUN_UPDATED,
     STREAM_START,
@@ -36,16 +37,20 @@ from pythonapi.infrastructure.redis_client import (
     build_redis_client,
 )
 from pythonapi.main import app
+from pythonapi.models.orm import VoiceRunRow
 from pythonapi.models.voice import (
     ClipSummary,
     TrainingProgress,
+    VideoClips,
     VideoResult,
-    VideoSpeakerSummary,
-    VideoSummary,
     VoiceRun,
     VoiceRunPhase,
 )
-from pythonapi.repositories.voice_runs import InMemoryVoiceRunRepository
+from pythonapi.repositories.voice_runs import (
+    InMemoryVoiceRunRepository,
+    _row_from_run,
+    _run_from_row,
+)
 from pythonapi.routes.voice import get_voice_events
 from pythonapi.workers.voice_run_reconciler import VoiceRunReconciler
 
@@ -68,8 +73,11 @@ class FakeVoiceFactoryGateway:
         self.get_clips_video_ids: list[str] = []
         self.update_clips_video_ids: list[str] = []
         self.stream_clip_audio_video_ids: list[str] = []
-        self.videos: list[VideoSummary] = []
-        self.video_speakers: list[VideoSpeakerSummary] = []
+        # dicts, not models: the routes pass the factory's own payload
+        # through, so a field the factory adds must survive the trip
+        self.videos: list[dict] = []
+        self.video_speakers: list[dict] = []
+        self.speaker_map: dict[str, str | None] = {}
         self.clip_audio: bytes = b""
         self.next_job_id = 0
         self.fail_with: VoiceFactoryError | None = None
@@ -120,18 +128,22 @@ class FakeVoiceFactoryGateway:
         self._guard()
         self.cancelled_jobs.append(job_id)
 
-    async def list_videos(self) -> list[VideoSummary]:
+    async def list_videos(self) -> list[dict]:
         self._guard()
         return list(self.videos)
 
-    async def get_video_speakers(self, video_id: str) -> list[VideoSpeakerSummary]:
+    async def get_video_speakers(self, video_id: str) -> list[dict]:
         self._guard()
         return list(self.video_speakers)
 
-    async def get_clips(self, video_id: str) -> list[ClipSummary]:
+    async def get_clips(self, video_id: str) -> VideoClips:
         self._guard()
         self.get_clips_video_ids.append(video_id)
-        return list(self.clips)
+        return VideoClips(
+            video_id=video_id,
+            speaker_map=dict(self.speaker_map),
+            clips=list(self.clips),
+        )
 
     async def update_clips(self, video_id: str, decisions: list[dict]) -> int:
         self._guard()
@@ -274,132 +286,14 @@ async def published_runs(event_stream: VoiceEventStream) -> list[VoiceRun]:
 # --- routes ---------------------------------------------------------------
 
 
-def test_voice_routes_report_503_when_the_factory_is_not_configured(client):
-    """VOICE_FACTORY_URL is unset in tests, so the gateway is None."""
-    response = client.get("/api/voice/search", params={"query": "janeway"})
-
-    assert response.status_code == 503
-    assert "VOICE_FACTORY_URL" in response.json()["detail"]
 
 
-def test_search_returns_videos(voice_client):
-    response = voice_client.get("/api/voice/search", params={"query": "janeway"})
+def test_the_run_keyed_clip_routes_are_gone(voice_client):
+    """Clips belong to the video. No caller may outlive its route."""
+    assert voice_client.get("/api/voice/runs/run1/speakers").status_code == 404
+    audio = voice_client.get("/api/voice/runs/run1/clips/clip_0001/audio")
+    assert audio.status_code == 404
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["query"] == "janeway"
-    assert body["videos"][0]["video_id"] == "vid_abc123"
-
-
-def test_list_videos_returns_every_ingested_video_with_no_character(
-    voice_client, gateway
-):
-    """FR13: browsing videos never scopes by character."""
-    gateway.videos = [
-        VideoSummary(video_id="vid_abc123", diarized=True, reviewed=True, clip_count=3)
-    ]
-
-    response = voice_client.get("/api/voice/videos")
-
-    assert response.status_code == 200
-    assert response.json() == [
-        {
-            "video_id": "vid_abc123",
-            "diarized": True,
-            "reviewed": True,
-            "clip_count": 3,
-        }
-    ]
-
-
-def test_get_video_speakers_returns_labels_and_clip_counts(voice_client, gateway):
-    gateway.video_speakers = [
-        VideoSpeakerSummary(speaker_label="SPEAKER_00", clip_count=2, kept_count=1)
-    ]
-
-    response = voice_client.get("/api/voice/videos/vid_abc123/speakers")
-
-    assert response.status_code == 200
-    assert response.json() == [
-        {"speaker_label": "SPEAKER_00", "clip_count": 2, "kept_count": 1}
-    ]
-
-
-def test_list_videos_reports_502_when_the_factory_is_unreachable(voice_client, gateway):
-    gateway.fail_with = VoiceFactoryError("connection refused")
-
-    response = voice_client.get("/api/voice/videos")
-
-    assert response.status_code == 502
-
-
-def test_get_video_speakers_reports_502_when_the_factory_is_unreachable(
-    voice_client, gateway
-):
-    gateway.fail_with = VoiceFactoryError("connection refused")
-
-    response = voice_client.get("/api/voice/videos/vid_abc123/speakers")
-
-    assert response.status_code == 502
-
-
-def test_commit_clips_routes_the_payload_and_returns_counts(voice_client, gateway):
-    """FR14: one call, several videos, several characters."""
-    gateway.committed = {"janeway": 2, "chakotay": 1}
-
-    response = voice_client.post(
-        "/api/voice/commit",
-        json={
-            "assignments": {
-                "vid1": {"SPEAKER_00": "janeway", "SPEAKER_01": "chakotay"},
-                "vid2": {"SPEAKER_00": "chakotay"},
-            }
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"committed": {"janeway": 2, "chakotay": 1}}
-    assert gateway.commit_calls == [
-        {
-            "vid1": {"SPEAKER_00": "janeway", "SPEAKER_01": "chakotay"},
-            "vid2": {"SPEAKER_00": "chakotay"},
-        }
-    ]
-
-
-def test_commit_clips_reports_409_on_a_speaker_map_conflict(voice_client, gateway):
-    gateway.fail_with = VoiceFactoryError("conflict", status_code=409)
-
-    response = voice_client.post(
-        "/api/voice/commit",
-        json={"assignments": {"vid1": {"SPEAKER_00": "janeway"}}},
-    )
-
-    assert response.status_code == 409
-
-
-def test_commit_clips_reports_404_for_an_unknown_video(voice_client, gateway):
-    gateway.fail_with = VoiceFactoryError("no such video", status_code=404)
-
-    response = voice_client.post(
-        "/api/voice/commit",
-        json={"assignments": {"vid1": {"SPEAKER_00": "janeway"}}},
-    )
-
-    assert response.status_code == 404
-
-
-def test_commit_clips_reports_502_when_the_factory_is_unreachable(
-    voice_client, gateway
-):
-    gateway.fail_with = VoiceFactoryError("connection refused")
-
-    response = voice_client.post(
-        "/api/voice/commit",
-        json={"assignments": {"vid1": {"SPEAKER_00": "janeway"}}},
-    )
-
-    assert response.status_code == 502
 
 
 def test_start_run_resolves_the_video_and_returns_202(voice_client, repository):
@@ -431,19 +325,15 @@ def test_start_run_reports_502_when_the_factory_is_unreachable(voice_client, gat
     assert response.status_code == 502
 
 
-@pytest.mark.asyncio
-async def test_speaker_board_groups_clips_and_puts_rejects_last(
-    voice_client, gateway, repository
-):
+def test_speaker_board_groups_clips_and_puts_rejects_last(voice_client, gateway):
     gateway.clips = [
         clip("clip_0001", "SPEAKER_01"),
         clip("clip_0002", "SPEAKER_00"),
         clip("clip_0003", None, keep=False),
         clip("clip_0004", "SPEAKER_00"),
     ]
-    await repository.create_run(make_run(VoiceRunPhase.AWAITING_REVIEW))
 
-    response = voice_client.get("/api/voice/runs/run1/speakers")
+    response = voice_client.get("/api/voice/videos/vid_abc123/clips")
 
     assert response.status_code == 200
     speakers = response.json()["speakers"]
@@ -457,13 +347,41 @@ async def test_speaker_board_groups_clips_and_puts_rejects_last(
     assert speakers[2]["kept_count"] == 0
 
 
+def test_speaker_board_reads_a_video_no_run_has_claimed(voice_client, gateway):
+    """The board is keyed on the video, so a person can review a video that
+    no voice_runs row references at all."""
+    gateway.clips = [clip("clip_0001", "SPEAKER_00")]
+
+    response = voice_client.get("/api/voice/videos/vid_nobody_claimed/clips")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["video_id"] == "vid_nobody_claimed"
+    assert body["run_id"] is None
+    assert body["speakers"][0]["clip_count"] == 1
+
+
+def test_speaker_board_names_the_character_from_the_factory_map(voice_client, gateway):
+    """assigned_character comes from the factory's speaker_map.json, which is
+    the one copy. Nothing here keeps a second one."""
+    gateway.clips = [clip("clip_0001", "SPEAKER_00"), clip("clip_0002", "SPEAKER_01")]
+    gateway.speaker_map = {"SPEAKER_00": "janeway", "SPEAKER_01": None}
+
+    response = voice_client.get("/api/voice/videos/vid_abc123/clips")
+
+    assert response.status_code == 200
+    speakers = response.json()["speakers"]
+    assert speakers[0]["assigned_character"] == "janeway"
+    assert speakers[1]["assigned_character"] is None
+
+
 @pytest.mark.asyncio
 async def test_speaker_board_is_shared_across_characters_for_the_same_video(
     voice_client, gateway, repository
 ):
     """FR12: claiming an already-ingested video for a second character reads
-    the same shared artifacts, so the gateway call carries only the video id,
-    never a character."""
+    the same shared artifacts, so the call carries only the video id, never a
+    character and never a run."""
     gateway.clips = [clip("clip_0001", "SPEAKER_00")]
     await repository.create_run(
         make_run(
@@ -478,31 +396,13 @@ async def test_speaker_board_is_shared_across_characters_for_the_same_video(
         )
     )
 
-    first = voice_client.get("/api/voice/runs/run_janeway/speakers")
-    second = voice_client.get("/api/voice/runs/run_chakotay/speakers")
+    first = voice_client.get("/api/voice/videos/vid_abc123/clips")
+    second = voice_client.get("/api/voice/videos/vid_abc123/clips")
 
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json()["speakers"] == second.json()["speakers"]
     assert gateway.get_clips_video_ids == ["vid_abc123", "vid_abc123"]
-
-
-@pytest.mark.asyncio
-async def test_update_clips_writes_through_and_recounts(
-    voice_client, gateway, repository
-):
-    gateway.clips = [clip("clip_0001", "SPEAKER_00"), clip("clip_0002", "SPEAKER_00")]
-    await repository.create_run(make_run(VoiceRunPhase.AWAITING_REVIEW))
-
-    response = voice_client.patch(
-        "/api/voice/runs/run1/clips",
-        json={"decisions": [{"clip_id": "clip_0001", "keep": False}]},
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"updated": 1, "approved_count": 1}
-    assert gateway.clip_updates == [[{"clip_id": "clip_0001", "keep": False}]]
-    assert gateway.update_clips_video_ids == ["vid_abc123"]
 
 
 @pytest.mark.asyncio
@@ -523,6 +423,8 @@ async def test_approve_writes_the_speaker_map_and_moves_to_committing(
     ]
     stored = await repository.get_run("run1")
     assert stored.phase is VoiceRunPhase.COMMITTING
+    # the map went to the factory and nowhere else: this service keeps no copy
+    assert not hasattr(stored, "speaker_map")
 
 
 @pytest.mark.asyncio
@@ -549,20 +451,6 @@ async def test_approve_rejects_a_map_with_no_character(voice_client, repository)
     )
 
     assert response.status_code == 422
-
-
-@pytest.mark.asyncio
-async def test_get_clip_audio_streams_from_the_gateway(
-    voice_client, gateway, repository
-):
-    gateway.clip_audio = b"RIFF-fake-wav-bytes"
-    await repository.create_run(make_run(VoiceRunPhase.AWAITING_REVIEW))
-
-    response = voice_client.get("/api/voice/runs/run1/clips/clip_0001/audio")
-
-    assert response.status_code == 200
-    assert response.content == b"RIFF-fake-wav-bytes"
-    assert gateway.stream_clip_audio_video_ids == ["vid_abc123"]
 
 
 def test_get_run_reports_404_for_an_unknown_id(voice_client):
@@ -695,11 +583,11 @@ async def test_a_full_run_reaches_ready(reconciler, repository, gateway):
     # five ingest steps at two ticks apiece, plus the DIARIZING node's own
     # tick, leaves no room to spare in the default budget
     parked = await run_until(VoiceRunPhase.AWAITING_REVIEW, max_ticks=16)
-    assert parked.clip_count == 1
+    assert parked.phase is VoiceRunPhase.AWAITING_REVIEW
 
-    # the human step: approve, which the reconciler never does on its own
+    # the human step: approve, which the reconciler never does on its own.
+    # The speaker map goes to the factory, so nothing is set on the run here.
     parked.phase = VoiceRunPhase.COMMITTING
-    parked.speaker_map = {"SPEAKER_00": "janeway"}
     await repository.update_run(parked)
 
     finished = await run_until(VoiceRunPhase.READY)
@@ -1086,7 +974,7 @@ async def test_a_phase_change_publishes_the_complete_run(
 
     published = await published_runs(event_stream)
     assert [run.phase for run in published] == [VoiceRunPhase.AWAITING_REVIEW]
-    assert published[0].clip_count == 1
+    assert published[0].id == "run1"
 
 
 @pytest.mark.asyncio
@@ -1271,3 +1159,69 @@ async def test_reconnecting_with_last_event_id_replays_what_was_missed(
     # a reconnect resumes, so no snapshot, and only what came after seen_id
     assert "STATE_SNAPSHOT" not in replayed
     assert '"ready"' in replayed
+
+
+# --- what the run table may hold -------------------------------------------
+
+
+def test_voice_runs_keeps_no_fact_the_factory_owns():
+    """CAP-1: one writer per fact. Every column left is something that would
+    be lost if the factory's work/ directory were deleted."""
+    columns = set(VoiceRunRow.__table__.columns.keys())
+
+    assert columns.isdisjoint(
+        {"video_title", "speaker_map", "clip_count", "approved_count"}
+    )
+    # the join to the factory, and the Voice map that has no factory twin
+    assert "video_id" in columns
+    assert VoiceRunRow.__table__.columns["video_id"].nullable
+    assert "voice_assignments" in columns
+
+
+def test_voice_assignments_survive_the_row_round_trip():
+    """The one thing in this change that cannot be recomputed from the
+    factory, so the migration must carry it."""
+    run = make_run(
+        VoiceRunPhase.AWAITING_REVIEW,
+        voice_assignments={"SPEAKER_00": "voice1", "SPEAKER_01": None},
+    )
+
+    restored = _run_from_row(_row_from_run(run))
+
+    assert restored.voice_assignments == {"SPEAKER_00": "voice1", "SPEAKER_01": None}
+    assert restored.video_id == "vid_abc123"
+
+
+# --- titles come from the factory ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_title_resolves_from_the_factory_for_the_video_it_still_holds(gateway):
+    gateway.videos = [{"video_id": "vid_abc123", "title": "Janeway speaks"}]
+
+    titles = await resolve_video_titles(gateway, ["vid_abc123"])
+
+    assert titles == {"vid_abc123": "Janeway speaks"}
+
+
+@pytest.mark.asyncio
+async def test_an_orphaned_run_resolves_no_title(gateway):
+    """A run whose video the factory no longer lists is orphaned. It gets no
+    invented name, which is what lets the videos view mark it."""
+    gateway.videos = [{"video_id": "vid_abc123", "title": "Janeway speaks"}]
+
+    titles = await resolve_video_titles(gateway, ["vid_gone"])
+
+    assert titles == {}
+
+
+@pytest.mark.asyncio
+async def test_titles_degrade_to_nothing_when_the_factory_is_unreachable(gateway):
+    """Postgres owns the run, so a listing must still answer. Only the name is
+    lost. The videos view reads the factory directly and shows an error
+    instead - it never falls back to a stored copy."""
+    gateway.fail_with = VoiceFactoryError("connection refused")
+
+    titles = await resolve_video_titles(gateway, ["vid_abc123"])
+
+    assert titles == {}

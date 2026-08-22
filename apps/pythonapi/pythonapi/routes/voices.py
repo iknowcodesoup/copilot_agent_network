@@ -10,10 +10,13 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from pythonapi.core.video_titles import resolve_video_titles
+from pythonapi.core.voice_factory_gateway import VoiceFactoryGateway
 from pythonapi.dependencies import (
     get_required_voice_contribution_repository,
     get_required_voice_repository,
     get_required_voice_training_reconciler,
+    get_voice_factory_gateway,
 )
 from pythonapi.models.voices import Voice, VoicePhase, VoiceRequest, VoiceResponse
 from pythonapi.repositories.voice_contributions import VoiceContributionRepository
@@ -83,11 +86,25 @@ async def get_voice(
     contribution_repository: VoiceContributionRepository = Depends(
         get_required_voice_contribution_repository
     ),
+    gateway: VoiceFactoryGateway | None = Depends(get_voice_factory_gateway),
 ):
+    """One voice and the contributions committed into it.
+
+    A contribution row records which video it came from, never what that video
+    is called: the factory owns the title. It is resolved here, in one call
+    for the whole list, and stays None when the factory is unset or no longer
+    holds the video.
+    """
     voice = await _load_voice(repository, voice_id)
-    voice.contributions = await contribution_repository.list_contributions_for_voice(
+    contributions = await contribution_repository.list_contributions_for_voice(
         voice_id
     )
+    titles = await resolve_video_titles(
+        gateway, [contribution.video_id for contribution in contributions]
+    )
+    for contribution in contributions:
+        contribution.video_title = titles.get(contribution.video_id)
+    voice.contributions = contributions
     return voice
 
 

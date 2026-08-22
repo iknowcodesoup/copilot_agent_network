@@ -46,25 +46,42 @@ export interface VideoResult {
   url: string
 }
 
+/*
+ * One ingested video, as the voice factory describes it. The factory owns a
+ * video: its title, its clip count, and whether it was diarized or reviewed
+ * all come from work/ on that host, so nothing here is stored in Postgres and
+ * nothing here belongs to a run. Runs join onto this by videoId.
+ */
+export interface VideoSummary {
+  videoId: string
+  title: string
+  diarized: boolean
+  reviewed: boolean
+  clipCount: number
+  url: string | null
+  durationSec: number | null
+  channel: string | null
+  ingestedAt: string | null
+}
+
 export interface VoiceRun {
   id: string
   primaryCharacter: string
   sourceUrl: string
+  /* the only join to the factory, which owns the video itself. Null until the
+     run resolves it, and stale once that video is gone - see VideosView, which
+     marks such a run orphaned. */
   videoId: string | null
-  videoTitle: string | null
   phase: VoiceRunPhase
   diarize: boolean
   numSpeakers: number | null
-  speakerMap: Record<string, string | null>
-  /* speaker label -> Voice id, written by POST .../assign. Distinct from
-     speakerMap, which is the older jeanlucrecord-backed name-based map. */
+  /* speaker label -> Voice id, written by POST .../assign. The factory has no
+     Voice concept, so nothing there mirrors this. */
   voiceAssignments: Record<string, string | null>
   voyicerJobId: string | null
   /* which of DOWNLOADING's ordered ingest steps is in flight */
   ingestStageIndex: number
   commitStageIndex: number
-  clipCount: number
-  approvedCount: number
   checkpointPath: string | null
   /* last training progress the factory reported, pushed over the event stream */
   currentEpoch: number | null
@@ -128,9 +145,11 @@ export interface SpeakerGroup {
   clips: ClipSummary[]
 }
 
+/* Keyed on the video, because the clips are. runId is null for a video no run
+   has claimed. */
 export interface SpeakerBoard {
-  runId: string
   videoId: string
+  runId: string | null
   speakers: SpeakerGroup[]
 }
 
@@ -165,6 +184,7 @@ export interface ClipDecision {
   clipId: string
   keep?: boolean
   speakerLabel?: string | null
+  text?: string
 }
 
 // ── Durable Voice entity ───────────────────────────────────────────────────
@@ -242,7 +262,7 @@ export interface StudioClip extends ClipSummary {
   videoId: string
   /** stable ordering within the run */
   index: number
-  /** resolved voice from the run's speakerMap, when assigned */
+  /** resolved voice from the run's voiceAssignments, when assigned */
   assignedVoiceId?: string | null
 }
 
@@ -256,7 +276,7 @@ export interface LogLine {
 
 export interface Snapshot {
   runs: VoiceRun[]
-  videos: VideoResult[]
+  videos: VideoSummary[]
   clips: StudioClip[]
   voices: VoiceDetail[]
   training: TrainingProgress[]

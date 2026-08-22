@@ -6,7 +6,6 @@ factory host and the phase transitions belong to VoiceRunReconciler.
 """
 
 import uuid
-from collections import defaultdict
 from contextlib import suppress
 from datetime import UTC, datetime
 
@@ -16,6 +15,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.responses import StreamingResponse
 
 from pythonapi.config import settings
+from pythonapi.core.speaker_board import build_speaker_board
+from pythonapi.core.video_titles import resolve_video_titles
 from pythonapi.core.voice_events import (
     EVENT_RUN_LOG,
     EVENT_RUN_UPDATED,
@@ -33,19 +34,13 @@ from pythonapi.dependencies import (
     get_required_voice_repository,
     get_required_voice_run_reconciler,
     get_required_voice_run_repository,
+    get_voice_factory_gateway,
 )
 from pythonapi.models.voice import (
-    ClipDecisionRequest,
-    CommitRequest,
-    CommitResponse,
     JobLog,
     SpeakerAssignmentRequest,
     SpeakerBoard,
-    SpeakerGroup,
     TrainingProgress,
-    VideoSearchResponse,
-    VideoSpeakerSummary,
-    VideoSummary,
     VoiceLogChunk,
     VoiceRun,
     VoiceRunPhase,
@@ -64,11 +59,6 @@ from pythonapi.repositories.voices import VoiceRepository
 from pythonapi.workers.voice_run_reconciler import VoiceRunReconciler
 
 router = APIRouter(prefix="/voice", tags=["Voice"])
-
-# The browser plays clips through this service, so the voice factory host never
-# needs a CORS entry or a route out to the network.
-AUDIO_MEDIA_TYPE = "audio/wav"
-AUDIO_CHUNK_SIZE = 64 * 1024
 
 # Header the voice factory signs its webhooks with.
 WEBHOOK_TOKEN_HEADER = "X-Voice-Factory-Token"
@@ -92,87 +82,28 @@ async def _load_run(repository: VoiceRunRepository, run_id: str) -> VoiceRun:
     return run
 
 
-@router.get("/search", response_model=VideoSearchResponse)
-async def search_videos(
-    query: str = Query(min_length=1),
-    limit: int = Query(default=10, ge=1, le=50),
-    gateway: VoiceFactoryGateway = Depends(get_required_voice_factory_gateway),
-):
-    try:
-        videos = await gateway.search_videos(query, limit)
-    except VoiceFactoryError as error:
-        raise _unavailable(error) from error
-    return VideoSearchResponse(query=query, videos=videos)
+# Video search, characters, the video list, per-video speakers, clip decisions,
+# clip audio, and commit all moved to routes/voice_factory_proxy.py. The factory
+# owns every one of them and nothing here read their fields, so a typed route
+# was a second definition of a shape this service does not own.
 
 
-@router.get("/characters", response_model=list[str])
-async def list_characters(
-    gateway: VoiceFactoryGateway = Depends(get_required_voice_factory_gateway),
-):
-    try:
-        return await gateway.list_characters()
-    except VoiceFactoryError as error:
-        raise _unavailable(error) from error
-
-
-@router.get("/videos", response_model=list[VideoSummary])
-async def list_videos(
-    gateway: VoiceFactoryGateway = Depends(get_required_voice_factory_gateway),
-):
-    """Every ingested video, independent of any character (FR13).
-
-    Lets the dashboard offer an already-ingested video to a second character
-    without starting a run that would download or diarize it again.
-    """
-    try:
-        return await gateway.list_videos()
-    except VoiceFactoryError as error:
-        raise _unavailable(error) from error
-
-
-@router.get("/videos/{video_id}/speakers", response_model=list[VideoSpeakerSummary])
-async def get_video_speakers(
+@router.get("/videos/{video_id}/clips", response_model=SpeakerBoard)
+async def get_video_speaker_board(
     video_id: str,
     gateway: VoiceFactoryGateway = Depends(get_required_voice_factory_gateway),
 ):
-    """Detected speaker labels and clip counts for one video (FR13).
+    """Clips grouped by speaker, for the review screen.
 
-    Lets the dashboard show what a video contains before any run claims it.
+    Keyed on the video, because the clips are: a video ingested for one
+    character and claimed by another has one set of clips and one review, and
+    no run has to exist for a person to read them.
     """
     try:
-        return await gateway.get_video_speakers(video_id)
+        video_clips = await gateway.get_clips(video_id)
     except VoiceFactoryError as error:
         raise _unavailable(error) from error
-
-
-@router.post("/commit", response_model=CommitResponse)
-async def commit_clips(
-    commit_request: CommitRequest,
-    gateway: VoiceFactoryGateway = Depends(get_required_voice_factory_gateway),
-):
-    """Route reviewed clips from several videos to several characters in one
-    call (FR14).
-
-    Run-independent, like list_videos and get_video_speakers above: it acts
-    on the shared work/youtube/ directory, not on any one run. A conflicting
-    speaker-map entry anywhere in the payload leaves every video's map
-    untouched, reported as a 409, same shape as approve_run's speaker map
-    write.
-    """
-    try:
-        committed = await gateway.commit_clips(commit_request.assignments)
-    except VoiceFactoryError as error:
-        # any 4xx the control API returns is the operator's mistake, not the
-        # factory being unreachable -- a speaker-map conflict, an unknown
-        # video id, or _check_name rejecting an invalid character name in the
-        # payload -- so it keeps its own status instead of becoming the
-        # blanket 502 every other factory failure gets. status_code is None
-        # for a transport failure (VoiceFactoryTransientError), which falls
-        # through to _unavailable below along with any 5xx.
-        if error.status_code is not None and 400 <= error.status_code < 500:
-            raise HTTPException(error.status_code, str(error)) from error
-        raise _unavailable(error) from error
-    return CommitResponse(committed=committed)
+    return build_speaker_board(video_clips)
 
 
 @router.post(
@@ -244,74 +175,6 @@ async def delete_run(
     await repository.delete_run(run_id)
 
 
-@router.get("/runs/{run_id}/speakers", response_model=SpeakerBoard)
-async def get_speaker_board(
-    run_id: str,
-    gateway: VoiceFactoryGateway = Depends(get_required_voice_factory_gateway),
-    repository: VoiceRunRepository = Depends(get_required_voice_run_repository),
-):
-    """Clips grouped by speaker, for the review screen."""
-    run = await _load_run(repository, run_id)
-    if not run.video_id:
-        raise HTTPException(status.HTTP_409_CONFLICT, "This run has no video yet")
-
-    try:
-        clips = await gateway.get_clips(run.video_id)
-    except VoiceFactoryError as error:
-        raise _unavailable(error) from error
-
-    grouped = defaultdict(list)
-    for clip in clips:
-        grouped[clip.speaker_label].append(clip)
-
-    speakers = [
-        SpeakerGroup(
-            speaker_label=speaker_label,
-            assigned_character=run.speaker_map.get(speaker_label)
-            if speaker_label
-            else None,
-            clip_count=len(group),
-            kept_count=sum(1 for clip in group if clip.keep),
-            total_duration_sec=sum(clip.duration_sec or 0.0 for clip in group),
-            clips=group,
-        )
-        # None sorts last: the rejected group is the least interesting
-        for speaker_label, group in sorted(
-            grouped.items(), key=lambda item: (item[0] is None, item[0] or "")
-        )
-    ]
-    return SpeakerBoard(run_id=run.id, video_id=run.video_id, speakers=speakers)
-
-
-@router.patch("/runs/{run_id}/clips")
-async def update_clips(
-    run_id: str,
-    decisions_request: ClipDecisionRequest,
-    gateway: VoiceFactoryGateway = Depends(get_required_voice_factory_gateway),
-    repository: VoiceRunRepository = Depends(get_required_voice_run_repository),
-):
-    """Keep, reject, or reassign clips. Writes straight through to review.csv,
-    which stays the one source of truth for review decisions."""
-    run = await _load_run(repository, run_id)
-    if not run.video_id:
-        raise HTTPException(status.HTTP_409_CONFLICT, "This run has no video yet")
-
-    payload = [
-        decision.model_dump(exclude_none=True)
-        for decision in decisions_request.decisions
-    ]
-    try:
-        updated = await gateway.update_clips(run.video_id, payload)
-        clips = await gateway.get_clips(run.video_id)
-    except VoiceFactoryError as error:
-        raise _unavailable(error) from error
-
-    run.approved_count = sum(1 for clip in clips if clip.keep)
-    run.clip_count = len(clips)
-    await repository.update_run(run)
-    return {"updated": updated, "approved_count": run.approved_count}
-
-
 @router.post("/runs/{run_id}/approve", response_model=VoiceRun)
 async def approve_run(
     run_id: str,
@@ -341,7 +204,6 @@ async def approve_run(
     except VoiceFactoryError as error:
         raise _unavailable(error) from error
 
-    run.speaker_map = assignment.speaker_map
     run.phase = VoiceRunPhase.COMMITTING
     run.commit_stage_index = 0
     run.voyicer_job_id = None
@@ -375,6 +237,7 @@ async def assign_run(
     contribution_repository: VoiceContributionRepository = Depends(
         get_required_voice_contribution_repository
     ),
+    gateway: VoiceFactoryGateway | None = Depends(get_voice_factory_gateway),
 ):
     """Map a run's speaker labels to Voices.
 
@@ -384,8 +247,10 @@ async def assign_run(
     called separately, so relabeling a clip's speaker never has a side effect
     beyond recording it.
 
-    DB-only: no factory call, and it must keep working without a voice
-    factory configured - the contribution rows are the durable record.
+    The contribution rows are the durable record and they are written from
+    Postgres alone, so this keeps working without a voice factory configured.
+    The gateway is optional and supplies one thing: the video's title, which
+    the factory owns. Without it the rows are the same, unnamed.
     """
     run = await _require_awaiting_review(repository, run_id)
 
@@ -409,6 +274,8 @@ async def assign_run(
 
     run.voice_assignments = assign_request.assignments
 
+    titles = await resolve_video_titles(gateway, [run.video_id])
+
     now = datetime.now(UTC)
     contributions = [
         VoiceContribution(
@@ -416,7 +283,7 @@ async def assign_run(
             voice_id=voice_id,
             run_id=run.id,
             video_id=run.video_id,
-            video_title=run.video_title,
+            video_title=titles.get(run.video_id),
             speaker_label=speaker_label,
             created_at=now,
         )
@@ -461,31 +328,6 @@ async def commit_run(
     run.phase = VoiceRunPhase.COMMITTED
     await repository.update_run(run)
     return run
-
-
-@router.get("/runs/{run_id}/clips/{clip_id}/audio")
-async def get_clip_audio(
-    run_id: str,
-    clip_id: str,
-    gateway: VoiceFactoryGateway = Depends(get_required_voice_factory_gateway),
-    repository: VoiceRunRepository = Depends(get_required_voice_run_repository),
-):
-    """Stream one clip's audio through to the browser.
-
-    Proxied rather than served direct so the browser talks to one origin only,
-    and the voice factory host never has to face it.
-    """
-    run = await _load_run(repository, run_id)
-    if not run.video_id:
-        raise HTTPException(status.HTTP_409_CONFLICT, "This run has no video yet")
-
-    async def stream_audio():
-        async with gateway.stream_clip_audio(run.video_id, clip_id) as response:
-            response.raise_for_status()
-            async for chunk in response.aiter_bytes(AUDIO_CHUNK_SIZE):
-                yield chunk
-
-    return StreamingResponse(stream_audio(), media_type=AUDIO_MEDIA_TYPE)
 
 
 @router.get("/runs/{run_id}/logs", response_model=JobLog)

@@ -16,6 +16,7 @@ from pythonapi.dependencies import (
     get_required_voice_contribution_repository,
     get_required_voice_repository,
     get_required_voice_run_repository,
+    get_voice_factory_gateway,
 )
 from pythonapi.main import app
 from pythonapi.models.voice import VoiceRun, VoiceRunPhase
@@ -34,7 +35,6 @@ def make_run(phase: VoiceRunPhase, **overrides) -> VoiceRun:
         "primary_character": "janeway",
         "source_url": "https://www.youtube.com/watch?v=vid_abc123",
         "video_id": "vid_abc123",
-        "video_title": "Janeway speaks",
         "phase": phase,
         "created_at": now,
         "updated_at": now,
@@ -71,13 +71,34 @@ def contribution_repository() -> InMemoryVoiceContributionRepository:
     return InMemoryVoiceContributionRepository()
 
 
+class FakeTitleGateway:
+    """Only what a title lookup needs. assign and get_voice ask the factory
+    for the video's name and for nothing else."""
+
+    def __init__(self) -> None:
+        self.videos: list[dict] = [
+            {"video_id": "vid_abc123", "title": "Janeway speaks"}
+        ]
+
+    async def list_videos(self) -> list[dict]:
+        return list(self.videos)
+
+
 @pytest.fixture
-def assign_client(client, run_repository, voice_repository, contribution_repository):
+def title_gateway() -> FakeTitleGateway:
+    return FakeTitleGateway()
+
+
+@pytest.fixture
+def assign_client(
+    client, run_repository, voice_repository, contribution_repository, title_gateway
+):
     app.dependency_overrides[get_required_voice_run_repository] = lambda: run_repository
     app.dependency_overrides[get_required_voice_repository] = lambda: voice_repository
     app.dependency_overrides[get_required_voice_contribution_repository] = lambda: (
         contribution_repository
     )
+    app.dependency_overrides[get_voice_factory_gateway] = lambda: title_gateway
     return client
 
 
@@ -106,6 +127,7 @@ async def test_assign_single_speaker_writes_one_contribution_and_nothing_else(
     assert contribution["voice_id"] == "voice1"
     assert contribution["speaker_label"] == "SPEAKER_00"
     assert contribution["video_id"] == "vid_abc123"
+    # resolved from the factory's meta.json, not from any voice_runs column
     assert contribution["video_title"] == "Janeway speaks"
 
     stored_run = await run_repository.get_run("run1")
@@ -364,10 +386,72 @@ async def test_get_voice_lists_real_contributions_after_an_assign_with_no_commit
     contribution = body["contributions"][0]
     assert contribution["run_id"] == "run1"
     assert contribution["video_id"] == "vid_abc123"
+    # resolved from the factory's meta.json, not from any voice_runs column
     assert contribution["video_title"] == "Janeway speaks"
     assert contribution["speaker_label"] == "SPEAKER_00"
     assert contribution["voice_id"] == "voice1"
     assert contribution["created_at"]
+
+
+@pytest.mark.asyncio
+async def test_assign_still_records_a_contribution_without_a_voice_factory(
+    client, run_repository, voice_repository, contribution_repository
+):
+    """The contribution rows are Postgres's own record, so assigning must keep
+    working with VOICE_FACTORY_URL unset. Only the title is lost."""
+    app.dependency_overrides[get_required_voice_run_repository] = lambda: run_repository
+    app.dependency_overrides[get_required_voice_repository] = lambda: voice_repository
+    app.dependency_overrides[get_required_voice_contribution_repository] = lambda: (
+        contribution_repository
+    )
+    app.dependency_overrides[get_voice_factory_gateway] = lambda: None
+    await run_repository.create_run(make_run(VoiceRunPhase.AWAITING_REVIEW))
+    await voice_repository.create_voice(make_voice(id="voice1", name="Janeway"))
+
+    response = client.post(
+        "/api/voice/runs/run1/assign",
+        json={"assignments": {"SPEAKER_00": "voice1"}},
+    )
+
+    assert response.status_code == 201
+    contribution = response.json()["contributions"][0]
+    assert contribution["video_id"] == "vid_abc123"
+    assert contribution["video_title"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_second_character_reading_the_same_video_sees_the_same_title(
+    assign_client, run_repository, voice_repository, title_gateway
+):
+    """CAP-5: the title belongs to the video, so every run that points at the
+    same video reads the one name the factory holds."""
+    await run_repository.create_run(make_run(VoiceRunPhase.AWAITING_REVIEW))
+    await run_repository.create_run(
+        make_run(
+            VoiceRunPhase.AWAITING_REVIEW,
+            id="run2",
+            primary_character="chakotay",
+        )
+    )
+    await voice_repository.create_voice(make_voice(id="voice1", name="Janeway"))
+    await voice_repository.create_voice(make_voice(id="voice2", name="Chakotay"))
+
+    first = assign_client.post(
+        "/api/voice/runs/run1/assign",
+        json={"assignments": {"SPEAKER_00": "voice1"}},
+    )
+    second = assign_client.post(
+        "/api/voice/runs/run2/assign",
+        json={"assignments": {"SPEAKER_01": "voice2"}},
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert (
+        first.json()["contributions"][0]["video_title"]
+        == second.json()["contributions"][0]["video_title"]
+        == "Janeway speaks"
+    )
 
 
 @pytest.mark.asyncio

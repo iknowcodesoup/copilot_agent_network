@@ -12,11 +12,22 @@ import type { StudioClip } from "@/lib/types";
 
 type Filter = "all" | "kept" | "review" | "flagged";
 
-export function ClipTable({ runId }: { runId: string }) {
+/*
+ * Keyed on the video, because the clips are: review.csv belongs to the video
+ * and is shared by every character that claims it. runId is null for a video no
+ * run has claimed - the clips still read, and only the run actions go away.
+ */
+export function ClipTable({
+  videoId,
+  runId,
+}: {
+  videoId: string;
+  runId: string | null;
+}) {
   const [filter, setFilter] = useState<Filter>("all");
-  const board = useSpeakerBoard(runId, Boolean(runId));
-  const run = useVoiceRun(runId);
-  const commitRun = useCommitRun(runId);
+  const board = useSpeakerBoard(videoId, Boolean(videoId));
+  const run = useVoiceRun(runId ?? "", { enabled: Boolean(runId) });
+  const commitRun = useCommitRun(runId ?? "");
   const voiceAssignments = run.data?.voiceAssignments ?? {};
   const clips = useMemo(
     () => board.data?.speakers.flatMap((speaker) => speaker.clips) ?? [],
@@ -79,11 +90,11 @@ export function ClipTable({ runId }: { runId: string }) {
         ))}
         <button
           type="button"
-          disabled={!hasAssignment || commitRun.isPending}
+          disabled={!runId || !hasAssignment || commitRun.isPending}
           onClick={() => commitRun.mutate()}
           className={cn(
             "ml-auto rounded-full border px-2.5 py-1 font-mono text-[0.7rem]",
-            hasAssignment
+            runId && hasAssignment
               ? "border-primary/50 bg-primary/10 text-primary hover:bg-primary/20"
               : "border-border text-muted-foreground/50",
           )}
@@ -98,8 +109,8 @@ export function ClipTable({ runId }: { runId: string }) {
             clip={
               {
                 ...clip,
-                runId,
-                videoId: runId,
+                runId: runId ?? "",
+                videoId,
                 index: clip.startSec ?? 0,
                 assignedVoiceId:
                   voiceAssignments[clip.speakerLabel ?? clip.clipId] ?? null,

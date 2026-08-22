@@ -19,6 +19,7 @@ import {
   useUpdateClips,
   voiceQueryKeys,
   voicesApiBase,
+  useVideos,
   useVoiceList,
   useVoiceRuns,
   VoiceApiError,
@@ -28,7 +29,7 @@ import type {
   Snapshot,
   StudioClip,
   TrainingProgress,
-  VideoResult,
+  VideoSummary,
   VoiceDetail,
   VoiceRun,
 } from "@/lib/types";
@@ -42,13 +43,15 @@ interface StudioContextValue {
   setView: (v: View) => void;
   selectedRunId: string | null;
   setSelectedRunId: (id: string | null) => void;
+  selectedVideoId: string | null;
+  setSelectedVideoId: (id: string | null) => void;
   selectedVoiceId: string | null;
   setSelectedVoiceId: (id: string | null) => void;
   logFilter: string;
   setLogFilter: (k: string) => void;
   clipsForRun: (runId: string) => StudioClip[];
   clipsForVoice: (voiceId: string) => StudioClip[];
-  videoForRun: (run: VoiceRun) => VideoResult | undefined;
+  videoForRun: (run: VoiceRun) => VideoSummary | undefined;
   trainingForVoice: (voice: VoiceDetail) => TrainingProgress | undefined;
   addVideo: (url: string, title?: string) => Promise<VoiceRun | null>;
   updateClip: (
@@ -78,20 +81,47 @@ const EMPTY: Snapshot = {
 export function StudioProvider({ children }: { children: React.ReactNode }) {
   const queryClient = useQueryClient();
   const runsQuery = useVoiceRuns();
+  const videosQuery = useVideos();
   const voicesQuery = useVoiceList();
   const startRun = useStartRun();
   const createVoiceMutation = useCreateVoice();
-  const updateClips = useUpdateClips("");
   const [view, setView] = useState<View>("videos");
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunIdState] = useState<string | null>(null);
+  const [selectedVideoId, setSelectedVideoId] = useState<string | null>(null);
   const [selectedVoiceId, setSelectedVoiceId] = useState<string | null>(null);
   const [logFilter, setLogFilter] = useState("all");
-  const activeRunId = selectedRunId ?? runsQuery.data?.[0]?.id ?? "";
+  const runs = runsQuery.data ?? [];
+  /* Selection is keyed by video, since a freshly ingested video may have no
+     run yet - two such videos both reduce to a null runId and would
+     otherwise be indistinguishable. setSelectedRunId (used by the assistant,
+     which only ever selects an existing run) keeps selectedVideoId in sync. */
+  const setSelectedRunId = useCallback(
+    (id: string | null) => {
+      setSelectedRunIdState(id);
+      setSelectedVideoId(
+        (id ? runs.find((run) => run.id === id)?.videoId : null) ?? null,
+      );
+    },
+    [runs],
+  );
+  const activeRunId =
+    (selectedVideoId
+      ? runs.find((run) => run.videoId === selectedVideoId)?.id
+      : selectedRunId) ??
+    runsQuery.data?.[0]?.id ??
+    "";
+  /* Clips are addressed by video, so the board and every clip write need the
+     run's video, not the run. A run with no video id has no clips to show. */
+  const activeVideoId =
+    runs.find((run) => run.id === activeRunId)?.videoId ?? "";
+  const updateClips = useUpdateClips(activeVideoId);
   const logQuery = useJobLog(activeRunId, Boolean(activeRunId));
-  const speakerBoardQuery = useSpeakerBoard(activeRunId, Boolean(activeRunId));
+  const speakerBoardQuery = useSpeakerBoard(
+    activeVideoId,
+    Boolean(activeVideoId),
+  );
   const assignRun = useAssignRun(activeRunId);
   const commitRunMutation = useCommitRun(activeRunId);
-  const runs = runsQuery.data ?? [];
   const voices: VoiceDetail[] = (voicesQuery.data ?? []).map((voice) => ({
     ...voice,
     checkpointPath: null,
@@ -100,16 +130,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     createdAt: "",
     updatedAt: "",
   }));
-  const videos = runs.map(
-    (run): VideoResult => ({
-      videoId: run.videoId ?? run.id,
-      title: run.videoTitle ?? "Untitled video",
-      durationSec: null,
-      channel: null,
-      thumbnailUrl: null,
-      url: run.sourceUrl,
-    }),
-  );
+  /* One source for videos, the factory, exactly as VideosView reads them.
+     Building them out of runs is what made a run and a video look like the
+     same row. */
+  const videos: VideoSummary[] = videosQuery.data ?? [];
   const snapshot: Snapshot = { ...EMPTY, runs, voices, videos };
   const logs: LogLine[] = (logQuery.data?.content ?? "")
     .split(/\r?\n/)
@@ -130,8 +154,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       .map((clip, index) => ({
         ...clip,
         runId: activeRunId,
-        videoId:
-          runs.find((run) => run.id === activeRunId)?.videoId ?? activeRunId,
+        videoId: activeVideoId,
         index,
         assignedVoiceId:
           activeVoiceAssignments[clip.speakerLabel ?? clip.clipId] ?? null,
@@ -144,8 +167,13 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     (voiceId: string) => clips.filter((clip) => clip.speakerLabel === voiceId),
     [clips],
   );
+  /* A run with no video id, or one the factory no longer lists, has no video.
+     Undefined says so - it must never fall through to another run's. */
   const videoForRun = useCallback(
-    (run: VoiceRun) => videos.find((video) => video.videoId === run.videoId),
+    (run: VoiceRun) =>
+      run.videoId
+        ? videos.find((video) => video.videoId === run.videoId)
+        : undefined,
     [videos],
   );
   const trainingForVoice = useCallback(() => undefined, []);
@@ -166,12 +194,17 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       clipId: string,
       patch: { speakerLabel?: string; text?: string; keep?: boolean },
     ) => {
-      if (!activeRunId) return;
+      if (!activeVideoId) return;
       await updateClips.mutateAsync([
-        { clipId, keep: patch.keep, speakerLabel: patch.speakerLabel },
+        {
+          clipId,
+          keep: patch.keep,
+          speakerLabel: patch.speakerLabel,
+          text: patch.text,
+        },
       ]);
     },
-    [activeRunId, updateClips],
+    [activeVideoId, updateClips],
   );
   const assignClipVoice = useCallback(
     async (clipId: string, voiceId: string) => {
@@ -239,6 +272,8 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       setView,
       selectedRunId,
       setSelectedRunId,
+      selectedVideoId,
+      setSelectedVideoId,
       selectedVoiceId,
       setSelectedVoiceId,
       logFilter,
@@ -262,6 +297,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       runsQuery.isError,
       view,
       selectedRunId,
+      selectedVideoId,
       selectedVoiceId,
       logFilter,
       clipsForRun,

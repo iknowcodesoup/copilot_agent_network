@@ -3,7 +3,7 @@
 import { Film, Scissors } from "lucide-react";
 import { StatusPill } from "./status-pill";
 import { cn } from "@/lib/utils";
-import type { VideoResult, VoiceRunPhase } from "@/lib/types";
+import type { VideoSummary, VoiceRunPhase } from "@/lib/types";
 
 function toneForPhase(
   phase: VoiceRunPhase,
@@ -14,20 +14,21 @@ function toneForPhase(
   return "in-progress";
 }
 
+/* The video describes itself, counts included: they come from the factory,
+   which recomputes them from review.csv. phase is null for a video no run has
+   claimed - ingested for one character, and offered to the next. */
 export function VideoCard({
   video,
   phase,
-  clipCount,
   selected,
   onSelect,
 }: {
-  video: VideoResult;
-  phase: VoiceRunPhase;
-  clipCount: number;
+  video: VideoSummary;
+  phase: VoiceRunPhase | null;
   selected: boolean;
   onSelect: () => void;
 }) {
-  const tone = toneForPhase(phase);
+  const tone = phase ? toneForPhase(phase) : null;
   return (
     <button
       type="button"
@@ -40,15 +41,7 @@ export function VideoCard({
       )}
     >
       <div className="relative flex h-20 items-end overflow-hidden bg-muted/30 px-3 pb-3 pt-6">
-        {video.thumbnailUrl ? (
-          <img
-            src={video.thumbnailUrl}
-            alt=""
-            className="absolute inset-0 size-full object-cover opacity-50"
-          />
-        ) : (
-          <Film className="absolute left-3 top-2 size-3.5 text-muted-foreground/60" />
-        )}
+        <Film className="absolute left-3 top-2 size-3.5 text-muted-foreground/60" />
         <div className="absolute inset-0 bg-background/35" />
       </div>
       <div className="flex flex-1 flex-col gap-2 p-3">
@@ -61,12 +54,16 @@ export function VideoCard({
               {video.channel ?? "Unknown channel"}
             </p>
           </div>
-          <StatusPill tone={tone} pulse={tone === "in-progress"} />
+          {tone ? (
+            <StatusPill tone={tone} pulse={tone === "in-progress"} />
+          ) : (
+            <StatusPill tone="queued" label="not started" />
+          )}
         </div>
         <div className="flex items-center justify-between font-mono text-[0.7rem] text-muted-foreground">
           <span className="inline-flex items-center gap-1">
             <Scissors className="size-3" />
-            {clipCount} clips
+            {video.clipCount} clips
           </span>
           {video.durationSec != null && (
             <span>{Math.round(video.durationSec / 60)} min</span>

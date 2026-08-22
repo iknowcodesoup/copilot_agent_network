@@ -61,29 +61,10 @@ class VideoSearchResponse(BaseModel):
     videos: list[VideoResult] = Field(default_factory=list)
 
 
-class VideoSummary(BaseModel):
-    """One ingested video, independent of any character.
-
-    Lets the dashboard offer an already-ingested video to a second character
-    without asking the factory to download or diarize it again.
-    """
-
-    video_id: str
-    diarized: bool = False
-    reviewed: bool = False
-    clip_count: int = 0
-
-
-class VideoSpeakerSummary(BaseModel):
-    """One speaker label detected in a video, before any run claims it.
-
-    speaker_label is None for the group no single speaker owns -- cross-talk
-    or music, same meaning as SpeakerGroup.speaker_label below.
-    """
-
-    speaker_label: str | None
-    clip_count: int
-    kept_count: int
+# A video and its speakers are the factory's own facts, so this service passes
+# both through exactly as the factory shapes them. There is no model here on
+# purpose: a field the factory adds must reach the browser with no edit in this
+# repository, which a model would silently drop.
 
 
 class VoiceRunRequest(BaseModel):
@@ -110,15 +91,14 @@ class VoiceRun(BaseModel):
     id: str
     primary_character: str
     source_url: str
+    # the only join to the factory, which owns the video itself: its title,
+    # its clips, and which speaker each clip belongs to
     video_id: str | None = None
-    video_title: str | None = None
     phase: VoiceRunPhase
     diarize: bool = True
     num_speakers: int | None = None
-    # speaker label -> character name. None discards that speaker's clips.
-    speaker_map: dict[str, str | None] = Field(default_factory=dict)
-    # speaker label -> Voice id. Distinct from speaker_map: this is DB-only and
-    # Voice-ID-scoped, never pushed to the voice factory host. Set by
+    # speaker label -> Voice id. This is DB-only and Voice-ID-scoped, and the
+    # factory has no Voice concept, so nothing there mirrors it. Set by
     # POST .../assign, which stores this mapping and commits it - contribution
     # rows and phase change - in the same call.
     voice_assignments: dict[str, str | None] = Field(default_factory=dict)
@@ -127,8 +107,6 @@ class VoiceRun(BaseModel):
     ingest_stage_index: int = 0
     # which of COMMITTING's three ordered stages is in flight
     commit_stage_index: int = 0
-    clip_count: int = 0
-    approved_count: int = 0
     # last training progress the factory reported, over the webhook
     current_epoch: int | None = None
     current_loss: float | None = None
@@ -173,6 +151,20 @@ class ClipSummary(BaseModel):
     text: str = ""
 
 
+class VideoClips(BaseModel):
+    """One video's clips and its speaker map, as the factory returns them.
+
+    The two arrive in the same payload, so they are read together. The map
+    says which character each speaker label belongs to, and the factory owns
+    it - speaker_map.json beside the clips is the one copy.
+    """
+
+    video_id: str
+    # speaker label -> character name. None discards that speaker's clips.
+    speaker_map: dict[str, str | None] = Field(default_factory=dict)
+    clips: list[ClipSummary] = Field(default_factory=list)
+
+
 class SpeakerGroup(BaseModel):
     """Every clip pyannote attributed to one speaker.
 
@@ -189,8 +181,15 @@ class SpeakerGroup(BaseModel):
 
 
 class SpeakerBoard(BaseModel):
-    run_id: str
+    """Clips grouped by speaker, for the review screen.
+
+    Keyed on the video, because the clips are. run_id is None for a video no
+    run has claimed yet, which a second character browsing an already
+    ingested video is looking at.
+    """
+
     video_id: str
+    run_id: str | None = None
     speakers: list[SpeakerGroup] = Field(default_factory=list)
 
 
@@ -198,6 +197,7 @@ class ClipDecision(BaseModel):
     clip_id: str
     keep: bool | None = None
     speaker_label: str | None = None
+    text: str | None = None
 
 
 class ClipDecisionRequest(BaseModel):

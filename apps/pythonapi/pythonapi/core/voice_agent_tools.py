@@ -34,6 +34,7 @@ from langchain_core.tools import BaseTool, tool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ValidationError
 
+from pythonapi.core.video_titles import resolve_video_titles
 from pythonapi.core.voice_factory_gateway import (
     VoiceFactoryError,
     VoiceFactoryGateway,
@@ -98,6 +99,9 @@ def _build_tools(
             limit: How many runs to return, 1 to 25.
         """
         runs = await repository.list_runs(limit=_clamp(limit, MAX_LISTED_RUNS))
+        # one call names every video in the page, because the factory owns the
+        # title and a run row carries only the id
+        titles = await resolve_video_titles(gateway, [run.video_id for run in runs])
         # A summary, not the whole run: a full VoiceRun each would fill the
         # context with fields nobody asked about. get_voice_run has the rest.
         return _success(
@@ -107,7 +111,7 @@ def _build_tools(
                         "id": run.id,
                         "primary_character": run.primary_character,
                         "phase": run.phase.value,
-                        "video_title": run.video_title,
+                        "video_title": titles.get(run.video_id),
                         "error": run.error,
                     }
                     for run in runs
@@ -119,7 +123,7 @@ def _build_tools(
     async def get_voice_run(run_id: str) -> str:
         """Read one voice run in full.
 
-        Its phase, speaker map, clip counts, training progress, and any error.
+        Its phase, the video it came from, training progress, and any error.
 
         Args:
             run_id: The run id.

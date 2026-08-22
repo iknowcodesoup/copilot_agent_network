@@ -63,7 +63,6 @@ def make_run(phase: VoiceRunPhase, **overrides) -> VoiceRun:
         "primary_character": "janeway",
         "source_url": "https://www.youtube.com/watch?v=vid_abc123",
         "video_id": "vid_abc123",
-        "video_title": "Janeway speaks",
         "phase": phase,
         "created_at": now,
         "updated_at": now,

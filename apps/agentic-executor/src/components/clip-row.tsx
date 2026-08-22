@@ -7,10 +7,19 @@ import { VoiceSpeakerCombobox } from "./voice-speaker-combobox";
 import { AudioPlayerBar } from "./audio-player-bar";
 import { cn } from "@/lib/utils";
 import type { StudioClip } from "@/lib/types";
-import { clipAudioUrl } from "@/lib/voice_api";
+import { clipAudioUrl, useAssignRun, useUpdateClips } from "@/lib/voice_api";
 
+/*
+ * Clip writes target clip.videoId/clip.runId directly, never useStudio's
+ * activeVideoId/activeRunId. Those two "active" ids are StudioProvider's own
+ * fallback guess (first run's video) and can name a different video than the
+ * one this row is actually showing, which was silently sending edits to the
+ * wrong video's clips.
+ */
 export function ClipRow({ clip }: { clip: StudioClip }) {
-  const { snapshot, updateClip, assignClipVoice } = useStudio();
+  const { snapshot } = useStudio();
+  const updateClips = useUpdateClips(clip.videoId);
+  const assignRun = useAssignRun(clip.runId);
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(clip.text);
   const assignedVoiceName =
@@ -23,8 +32,13 @@ export function ClipRow({ clip }: { clip: StudioClip }) {
   const saveText = () => {
     setEditing(false);
     if (text.trim() && text !== clip.text)
-      updateClip(clip.clipId, { text: text.trim() });
+      updateClips.mutate([{ clipId: clip.clipId, text: text.trim() }]);
   };
+  /* Assignment is run-scoped on the factory, so a video no run has claimed
+     cannot take one. The combobox says so rather than accepting a click and
+     silently dropping it. */
+  const assignVoice = (voiceId: string) =>
+    assignRun.mutate({ [clip.speakerLabel ?? clip.clipId]: voiceId });
 
   return (
     <div
@@ -41,8 +55,8 @@ export function ClipRow({ clip }: { clip: StudioClip }) {
         <VoiceSpeakerCombobox
           speakerLabel={clip.speakerLabel ?? clip.clipId}
           assignedVoiceName={assignedVoiceName}
-          disabled={false}
-          onSelect={(voiceId) => assignClipVoice(clip.clipId, voiceId)}
+          disabled={!clip.runId}
+          onSelect={assignVoice}
         />
         {clip.flagged && (
           <span className="inline-flex items-center gap-1 rounded-md border border-warn/30 bg-warn/10 px-1.5 py-0.5 font-mono text-[0.65rem] uppercase text-warn">
@@ -60,7 +74,7 @@ export function ClipRow({ clip }: { clip: StudioClip }) {
           </span>
           <button
             type="button"
-            onClick={() => updateClip(clip.clipId, { keep: true })}
+            onClick={() => updateClips.mutate([{ clipId: clip.clipId, keep: true }])}
             aria-label="Keep clip"
             className={cn(
               "flex size-7 items-center justify-center rounded-md border",
@@ -73,7 +87,7 @@ export function ClipRow({ clip }: { clip: StudioClip }) {
           </button>
           <button
             type="button"
-            onClick={() => updateClip(clip.clipId, { keep: false })}
+            onClick={() => updateClips.mutate([{ clipId: clip.clipId, keep: false }])}
             aria-label="Exclude clip"
             className={cn(
               "flex size-7 items-center justify-center rounded-md border",
@@ -123,7 +137,7 @@ export function ClipRow({ clip }: { clip: StudioClip }) {
       </div>
       <div className="mt-2">
         <AudioPlayerBar
-          src={clipAudioUrl(clip.runId, clip.clipId)}
+          src={clipAudioUrl(clip.videoId, clip.clipId)}
           peaks={[]}
           durationSec={clip.durationSec ?? 0}
           accent="var(--primary)"

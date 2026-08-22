@@ -7,16 +7,16 @@ import type { VoiceRun, VoiceRunPhase } from "./types"
 // migration decisions, we synthesize them here instead of storing them on the
 // backend contract:
 //   - voice color: auto-assigned from a stable hash of the voice id
-//   - clip audio URL: composed from the run + clip ids
+//   - clip audio URL: composed from the video + clip ids
 //   - phase → status-pill tone / progress semantics
 // ---------------------------------------------------------------------------
 
 /** Base URL of the voice API. Empty = same-origin (the simulated backend). */
 export const VOICE_API_BASE = process.env.NEXT_PUBLIC_VOICE_API_BASE ?? ""
 
-/** Audio for a clip is composable from its run + clip id (no stored URL). */
-export function clipAudioUrl(runId: string, clipId: string): string {
-  return `${VOICE_API_BASE}/runs/${runId}/clips/${clipId}/audio`
+/** Audio for a clip is composable from its video + clip id (no stored URL). */
+export function clipAudioUrl(videoId: string, clipId: string): string {
+  return `${VOICE_API_BASE}/videos/${videoId}/clips/${clipId}/audio`
 }
 
 const VOICE_PALETTE = [
@@ -69,7 +69,11 @@ export function isPhaseActive(phase: VoiceRunPhase): boolean {
   )
 }
 
-/** A run's display title, falling back through the fields the API may fill. */
+/** A run's display title.
+
+    The video's real name belongs to the video, which the factory owns, so a
+    run names itself by the character it is training. Where the video's title
+    matters, read it from the videos list and join on videoId. */
 export function runTitle(run: VoiceRun): string {
-  return run.videoTitle || run.primaryCharacter || run.sourceUrl
+  return run.primaryCharacter || run.sourceUrl
 }

@@ -8,6 +8,7 @@ import {
 } from "@tanstack/react-query";
 import {
   ClipDecision,
+  ClipSummary,
   CommitStageLabels,
   IngestStageLabels,
   JobLog,
@@ -16,6 +17,7 @@ import {
   SpeakerBoard,
   TrainingProgress,
   VideoResult,
+  VideoSummary,
   VoiceDetail,
   VoicePhase,
   VoiceRun,
@@ -24,20 +26,9 @@ import {
 } from "./types";
 
 export * from "./types";
+export * from "./voice_endpoints";
 
-export const pythonApiUrl =
-  process.env.NEXT_PUBLIC_PYTHON_API_URL ?? "http://localhost:8000";
-
-export const voiceApiBase = `${pythonApiUrl}/api/voice`;
-
-/*
- * The durable Voice entity lives under its own router (routes/voices.py,
- * plural), a sibling of the run-pipeline router above (routes/voice.py,
- * singular) - see main.py's api_router.include_router calls. Same host,
- * different path, so it needs its own base and its own request() rather
- * than sharing voiceApiBase.
- */
-export const voicesApiBase = `${pythonApiUrl}/api/voices`;
+import { voiceApiBase, voiceFactoryBase, voicesApiBase } from "./voice_endpoints";
 
 /* Phases where the pipeline is doing something on its own. */
 const activePhases: ReadonlySet<VoiceRunPhase> = new Set([
@@ -152,7 +143,11 @@ function speakerMapBody(speakerMap: Record<string, string | null>): string {
 export const voiceQueryKeys = {
   runs: ["voice", "runs"] as const,
   run: (runId: string) => ["voice", "runs", runId] as const,
-  speakers: (runId: string) => ["voice", "runs", runId, "speakers"] as const,
+  /* Deliberately outside ["voice","runs"]: the videos list is the factory's
+     answer, not a run's, and useStartRun invalidates the whole run subtree. */
+  videos: ["voice", "videos"] as const,
+  speakers: (videoId: string) =>
+    ["voice", "videos", videoId, "clips"] as const,
   training: (runId: string) => ["voice", "runs", runId, "training"] as const,
   log: (runId: string) => ["voice", "runs", runId, "log"] as const,
   search: (query: string) => ["voice", "search", query] as const,
@@ -162,8 +157,9 @@ export const voiceQueryKeys = {
   voiceDetail: (voiceId: string) => ["voice", "voiceDetail", voiceId] as const,
 };
 
-export function clipAudioUrl(runId: string, clipId: string): string {
-  return `${voiceApiBase}/runs/${runId}/clips/${clipId}/audio`;
+/* Keyed on the video, so playing a clip never depends on a run lookup. */
+export function clipAudioUrl(videoId: string, clipId: string): string {
+  return `${voiceFactoryBase}/videos/${videoId}/clips/${clipId}/audio`;
 }
 
 /*
@@ -205,10 +201,34 @@ export function useVoiceRun(
   });
 }
 
-export function useSpeakerBoard(runId: string, enabled: boolean) {
+/* Every ingested video the factory holds.
+
+   No STREAM_KEEPS_THIS_FRESH here on purpose: the event stream carries runs,
+   never videos, so staleTime: Infinity would freeze this list until a reload.
+   The factory is the only source - a failure surfaces as an error rather than
+   falling back to anything stored here. */
+export function useVideos() {
   return useQuery({
-    queryKey: voiceQueryKeys.speakers(runId),
-    queryFn: () => request<SpeakerBoard>(`/runs/${runId}/speakers`),
+    queryKey: voiceQueryKeys.videos,
+    /* The factory answers {videos: [...]}. The removed Python route used to
+       unwrap it; the proxy forwards it verbatim, so unwrap it here. */
+    queryFn: async () =>
+      (
+        await request<{ videos: VideoSummary[] }>(
+          "/videos",
+          undefined,
+          voiceFactoryBase,
+        )
+      ).videos,
+  });
+}
+
+/* Clips grouped by speaker, keyed on the video. A video with no run has a
+   board too, which is what lets a second character review one. */
+export function useSpeakerBoard(videoId: string, enabled: boolean) {
+  return useQuery({
+    queryKey: voiceQueryKeys.speakers(videoId),
+    queryFn: () => request<SpeakerBoard>(`/videos/${videoId}/clips`),
     enabled,
   });
 }
@@ -235,6 +255,8 @@ export function useVideoSearch(query: string) {
     queryFn: () =>
       request<{ query: string; videos: VideoResult[] }>(
         `/search?query=${encodeURIComponent(query)}&limit=12`,
+        undefined,
+        voiceFactoryBase,
       ),
     enabled: query.trim().length > 0,
     // a search costs a real yt-dlp call, so keep results around
@@ -245,7 +267,15 @@ export function useVideoSearch(query: string) {
 export function useCharacters() {
   return useQuery({
     queryKey: voiceQueryKeys.characters,
-    queryFn: () => request<string[]>("/characters"),
+    /* {characters: [...]} on the wire; the removed route unwrapped it. */
+    queryFn: async () =>
+      (
+        await request<{ characters: string[] }>(
+          "/characters",
+          undefined,
+          voiceFactoryBase,
+        )
+      ).characters,
     staleTime: 60_000,
   });
 }
@@ -269,20 +299,63 @@ export function useStartRun() {
   });
 }
 
-export function useUpdateClips(runId: string) {
+/* Write review decisions straight through to the factory's review.csv, which
+   stays the one source of truth for them. Nothing is counted back into a run:
+   the counts are the factory's, so the videos list is refreshed instead. */
+export function useUpdateClips(videoId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (decisions: ClipDecision[]) =>
-      request<{ updated: number; approvedCount: number }>(
-        `/runs/${runId}/clips`,
+      request<{ videoId: string; updated: number; clips: ClipSummary[] }>(
+        `/videos/${videoId}/clips`,
         { method: "PATCH", body: jsonBody({ decisions }) },
+        voiceFactoryBase,
       ),
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: voiceQueryKeys.speakers(runId),
-      });
-      queryClient.invalidateQueries({ queryKey: voiceQueryKeys.run(runId) });
+    /* The response carries the clips as they now stand, so write them in
+       rather than asking for them again. */
+    onSuccess: ({ clips }) => {
+      const edited = new Map(clips.map((clip) => [clip.clipId, clip]));
+      queryClient.setQueryData<SpeakerBoard>(
+        voiceQueryKeys.speakers(videoId),
+        (board) =>
+          board && {
+            ...board,
+            speakers: board.speakers.map((speaker) => ({
+              ...speaker,
+              clips: speaker.clips.map(
+                (clip) => edited.get(clip.clipId) ?? clip,
+              ),
+            })),
+          },
+      );
+      /* Keeping or excluding a clip moves the factory's own counts, and only
+         it can recompute them. */
+      queryClient.invalidateQueries({ queryKey: voiceQueryKeys.videos });
     },
+  });
+}
+
+/* Rename a video. The title lives in the factory's meta.json beside the clips,
+   so every character that claims the video reads the same name. Nothing is
+   stored here - the videos list is refetched instead. */
+export function useRenameVideo(videoId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (title: string) =>
+      request<VideoSummary>(
+        `/videos/${videoId}`,
+        { method: "PATCH", body: jsonBody({ title }) },
+        voiceFactoryBase,
+      ),
+    /* PATCH answers with the renamed video, so the list takes it as given. */
+    onSuccess: (video) =>
+      queryClient.setQueryData<VideoSummary[]>(
+        voiceQueryKeys.videos,
+        (videos) =>
+          videos?.map((existing) =>
+            existing.videoId === video.videoId ? video : existing,
+          ),
+      ),
   });
 }
 

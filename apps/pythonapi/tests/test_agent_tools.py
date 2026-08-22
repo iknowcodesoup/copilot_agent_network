@@ -157,6 +157,10 @@ class _StubGateway:
         self.resolved_urls.append(url)
         return "abc123"
 
+    async def list_videos(self) -> list[dict]:
+        # the factory owns the title, so listing runs asks it for the names
+        return [{"video_id": "abc123", "title": "Picard speaks"}]
+
 
 @pytest.fixture
 def repository():
@@ -307,6 +311,9 @@ async def test_list_runs_returns_summaries_not_whole_runs(registry, repository):
         "video_title",
         "error",
     }
+    # the title is resolved from the factory at read time, because no
+    # voice_runs column holds one
+    assert result["runs"][0]["video_title"] == "Picard speaks"
 
 
 # --------------------------------------------------------------------------

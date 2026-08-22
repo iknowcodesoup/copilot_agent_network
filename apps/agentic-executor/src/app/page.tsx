@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StudioProvider, useStudio } from "@/components/studio-provider";
+import { VoiceLiveState } from "@/lib/voice_event_stream";
 import { VideosView } from "@/components/videos-view";
 import { VoicesView } from "@/components/voices-view";
 import { LogMonitor } from "@/components/log-monitor";
@@ -132,6 +133,9 @@ export default function Page() {
   const [queryClient] = useState(() => new QueryClient());
   return (
     <QueryClientProvider client={queryClient}>
+      {/* One connection for the dashboard. Renders nothing; it only writes
+          pushed state into the query cache every hook below already reads. */}
+      <VoiceLiveState />
       <StudioProvider>
         <StudioShell />
       </StudioProvider>

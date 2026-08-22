@@ -30,9 +30,8 @@ from pythonapi.config import settings
 from pythonapi.models.voice import (
     ClipSummary,
     TrainingProgress,
+    VideoClips,
     VideoResult,
-    VideoSpeakerSummary,
-    VideoSummary,
 )
 
 # One video's speaker-map entries: speaker label -> character. A character of
@@ -183,22 +182,37 @@ class VoiceFactoryGateway:
     async def cancel_job(self, job_id: str) -> None:
         await self._request("DELETE", f"/jobs/{job_id}")
 
-    async def list_videos(self) -> list[VideoSummary]:
+    async def list_videos(self) -> list[dict]:
         """Every ingested video, independent of any character (FR13).
 
         Lets the dashboard offer an already-ingested video to a second
         character without asking the factory to download or diarize it again.
+
+        Returned unmodelled, because the factory owns the video: a field it
+        adds must reach the browser with no edit here.
         """
         payload = await self._request("GET", "/videos")
-        return [VideoSummary(**video) for video in payload["videos"]]
+        return list(payload["videos"])
 
-    async def get_video_speakers(self, video_id: str) -> list[VideoSpeakerSummary]:
+    async def get_video_speakers(self, video_id: str) -> list[dict]:
+        """One video's speaker labels, unmodelled for the same reason as
+        list_videos above."""
         payload = await self._request("GET", f"/videos/{video_id}/speakers")
-        return [VideoSpeakerSummary(**speaker) for speaker in payload["speakers"]]
+        return list(payload["speakers"])
 
-    async def get_clips(self, video_id: str) -> list[ClipSummary]:
+    async def get_clips(self, video_id: str) -> VideoClips:
+        """One video's clips and the speaker map that names their characters.
+
+        The factory sends both in one payload. Reading the map from here is
+        what lets the speaker board show assigned_character without a second
+        call, and without this service keeping a copy of the map.
+        """
         payload = await self._request("GET", f"/videos/{video_id}/clips")
-        return [ClipSummary(**clip) for clip in payload["clips"]]
+        return VideoClips(
+            video_id=payload.get("video_id", video_id),
+            speaker_map=payload.get("speaker_map") or {},
+            clips=[ClipSummary(**clip) for clip in payload["clips"]],
+        )
 
     async def update_clips(self, video_id: str, decisions: list[dict]) -> int:
         payload = await self._request(

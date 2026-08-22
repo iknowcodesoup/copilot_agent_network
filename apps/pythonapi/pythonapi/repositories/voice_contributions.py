@@ -90,8 +90,9 @@ def _contribution_from_row(
         id=contribution_row.id,
         voice_id=contribution_row.voice_id,
         run_id=contribution_row.run_id,
+        # video_id only: the factory owns the title, and a caller that wants
+        # one resolves it at read time -- see core/video_titles.py
         video_id=run_row.video_id,
-        video_title=run_row.video_title,
         speaker_label=contribution_row.speaker_label,
         created_at=contribution_row.created_at,
     )
