@@ -130,6 +130,9 @@ export interface ClipSummary {
   flagged: boolean
   speakerLabel: string | null
   speakerCoverage: number | null
+  /* who this clip is for, chosen per clip; speakerLabel is what diarization
+     heard and stays as recorded */
+  assignedVoice: string | null
   durationSec: number | null
   startSec: number | null
   endSec: number | null
@@ -184,6 +187,8 @@ export interface ClipDecision {
   clipId: string
   keep?: boolean
   speakerLabel?: string | null
+  /* empty string clears the assignment */
+  assignedVoice?: string | null
   text?: string
 }
 
@@ -262,8 +267,6 @@ export interface StudioClip extends ClipSummary {
   videoId: string
   /** stable ordering within the run */
   index: number
-  /** resolved voice from the run's voiceAssignments, when assigned */
-  assignedVoiceId?: string | null
 }
 
 export interface LogLine {

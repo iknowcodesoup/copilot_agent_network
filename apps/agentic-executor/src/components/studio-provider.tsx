@@ -146,8 +146,6 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       message,
     }));
 
-  const activeVoiceAssignments =
-    runs.find((run) => run.id === activeRunId)?.voiceAssignments ?? {};
   const clips: StudioClip[] =
     speakerBoardQuery.data?.speakers
       .flatMap((speaker) => speaker.clips)
@@ -156,8 +154,6 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         runId: activeRunId,
         videoId: activeVideoId,
         index,
-        assignedVoiceId:
-          activeVoiceAssignments[clip.speakerLabel ?? clip.clipId] ?? null,
       })) ?? [];
   const clipsForRun = useCallback(
     (runId: string) => (runId === activeRunId ? clips : []),

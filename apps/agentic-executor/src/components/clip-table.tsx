@@ -112,8 +112,6 @@ export function ClipTable({
                 runId: runId ?? "",
                 videoId,
                 index: clip.startSec ?? 0,
-                assignedVoiceId:
-                  voiceAssignments[clip.speakerLabel ?? clip.clipId] ?? null,
               } as StudioClip
             }
           />

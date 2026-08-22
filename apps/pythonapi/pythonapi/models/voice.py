@@ -145,6 +145,9 @@ class ClipSummary(BaseModel):
     flagged: bool = False
     speaker_label: str | None = None
     speaker_coverage: float | None = None
+    # Who this clip is for, chosen per clip by the reviewer. speaker_label is
+    # what diarization heard; this is the decision made about it.
+    assigned_voice: str | None = None
     duration_sec: float | None = None
     start_sec: float | None = None
     end_sec: float | None = None

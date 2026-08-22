@@ -2,29 +2,22 @@
 
 import { useEffect, useState } from "react";
 import { Check, X, Pencil, AudioLines } from "lucide-react";
-import { useStudio } from "./studio-provider";
 import { VoiceSpeakerCombobox } from "./voice-speaker-combobox";
 import { AudioPlayerBar } from "./audio-player-bar";
 import { cn } from "@/lib/utils";
 import type { StudioClip } from "@/lib/types";
-import { clipAudioUrl, useAssignRun, useUpdateClips } from "@/lib/voice_api";
+import { clipAudioUrl, useUpdateClips } from "@/lib/voice_api";
 
 /*
- * Clip writes target clip.videoId/clip.runId directly, never useStudio's
- * activeVideoId/activeRunId. Those two "active" ids are StudioProvider's own
- * fallback guess (first run's video) and can name a different video than the
- * one this row is actually showing, which was silently sending edits to the
- * wrong video's clips.
+ * Clip writes target clip.videoId directly, never useStudio's activeVideoId.
+ * That "active" id is StudioProvider's own fallback guess (first run's video)
+ * and can name a different video than the one this row is actually showing,
+ * which was silently sending edits to the wrong video's clips.
  */
 export function ClipRow({ clip }: { clip: StudioClip }) {
-  const { snapshot } = useStudio();
   const updateClips = useUpdateClips(clip.videoId);
-  const assignRun = useAssignRun(clip.runId);
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(clip.text);
-  const assignedVoiceName =
-    snapshot.voices.find((voice) => voice.id === clip.assignedVoiceId)?.name ??
-    null;
 
   useEffect(() => {
     if (!editing) setText(clip.text);
@@ -34,11 +27,10 @@ export function ClipRow({ clip }: { clip: StudioClip }) {
     if (text.trim() && text !== clip.text)
       updateClips.mutate([{ clipId: clip.clipId, text: text.trim() }]);
   };
-  /* Assignment is run-scoped on the factory, so a video no run has claimed
-     cannot take one. The combobox says so rather than accepting a click and
-     silently dropping it. */
-  const assignVoice = (voiceId: string) =>
-    assignRun.mutate({ [clip.speakerLabel ?? clip.clipId]: voiceId });
+  /* One clip, one assignment. It is written on the clip itself, so picking a
+     voice here moves this clip and no other. */
+  const assignVoice = (_voiceId: string, voiceName: string) =>
+    updateClips.mutate([{ clipId: clip.clipId, assignedVoice: voiceName }]);
 
   return (
     <div
@@ -54,10 +46,20 @@ export function ClipRow({ clip }: { clip: StudioClip }) {
         </span>
         <VoiceSpeakerCombobox
           speakerLabel={clip.speakerLabel ?? clip.clipId}
-          assignedVoiceName={assignedVoiceName}
-          disabled={!clip.runId}
+          assignedVoiceName={clip.assignedVoice}
           onSelect={assignVoice}
         />
+        {/* A rejected write must say so. Swallowing it is what made a failed
+            assignment look like a dead control. */}
+        {updateClips.isError && (
+          <span
+            role="alert"
+            className="max-w-xs truncate text-[0.65rem] text-destructive"
+            title={updateClips.error.message}
+          >
+            {updateClips.error.message}
+          </span>
+        )}
         {clip.flagged && (
           <span className="inline-flex items-center gap-1 rounded-md border border-warn/30 bg-warn/10 px-1.5 py-0.5 font-mono text-[0.65rem] uppercase text-warn">
             <AudioLines className="size-3" /> flagged

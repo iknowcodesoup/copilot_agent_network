@@ -19,13 +19,11 @@ import {
 export function VoiceSpeakerCombobox({
   speakerLabel,
   assignedVoiceName,
-  disabled,
   onSelect,
 }: {
   speakerLabel: string
   /* the currently assigned voice's name, or null when nothing is assigned */
   assignedVoiceName: string | null
-  disabled: boolean
   onSelect: (voiceId: string, voiceName: string) => void
 }) {
   const [open, setOpen] = useState(false)
@@ -82,7 +80,6 @@ export function VoiceSpeakerCombobox({
         aria-label={`Voice for ${speakerLabel}`}
         placeholder={assignedVoiceName ?? "search or create a voice"}
         className="h-7"
-        disabled={disabled}
         value={open ? query : (assignedVoiceName ?? "")}
         onFocus={() => {
           setQuery("")
